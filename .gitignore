@@ -1,0 +1,47 @@
+# =========================
+# Environment / Secrets
+# =========================
+
+.env
+.env.*
+!.env.example
+
+# =========================
+# Python
+# =========================
+
+backend/.venv/
+backend/__pycache__/
+backend/app/__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# SQLite
+# =========================
+
+*.db
+*.sqlite
+*.sqlite3
+
+# =========================
+# Next.js
+# =========================
+
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# =========================
+# Logs
+# =========================
+
+*.log
+
+# =========================
+# OS / Editor
+# =========================
+
+.DS_Store
+Thumbs.db
+.vscode/
