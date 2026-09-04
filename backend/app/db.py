@@ -101,6 +101,47 @@ def init_db() -> None:
 
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS merchant_config (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                p_list TEXT NOT NULL,
+                floor_1_9 TEXT NOT NULL,
+                floor_10_49 TEXT NOT NULL,
+                floor_50_99 TEXT NOT NULL,
+                floor_100_plus TEXT NOT NULL,
+                alpha TEXT NOT NULL,
+                max_rounds INTEGER NOT NULL
+            )
+            """
+        )
+
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO merchant_config (
+                id,
+                p_list,
+                floor_1_9,
+                floor_10_49,
+                floor_50_99,
+                floor_100_plus,
+                alpha,
+                max_rounds
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                1,
+                "100.00",
+                "90.00",
+                "88.00",
+                "85.00",
+                "80.00",
+                "1.5",
+                5,
+            ),
+        )
+
+        connection.execute(
+            """
             INSERT OR IGNORE INTO stock (
                 product_id,
                 quantity
@@ -392,6 +433,150 @@ def log_security_rejection(
         )
 
         connection.commit()
+
+
+# ============================================================================
+# Merchant analytics
+# ============================================================================
+
+
+def get_merchant_analytics() -> dict[str, Any]:
+    """
+    Calculate merchant analytics from completed negotiation sessions.
+
+    Security rejections are excluded because they are validation events,
+    not negotiation outcomes.
+    """
+
+    with get_connection() as connection:
+
+        rows = connection.execute(
+            """
+            SELECT
+                status,
+                history_json
+            FROM sessions
+            WHERE status IN ('accepted', 'no_deal')
+            """
+        ).fetchall()
+
+    accepted_count = 0
+    no_deal_count = 0
+    total_revenue = Decimal("0.00")
+    discounts: list[Decimal] = []
+    closing_rounds: list[int] = []
+
+    for row in rows:
+
+        history = json.loads(
+            row["history_json"],
+        )
+
+        if not history:
+            continue
+
+        final_entry = history[-1]
+
+        status = row["status"]
+
+        if status == "accepted":
+            accepted_count += 1
+
+            quantity = int(
+                final_entry["effective_quantity"],
+            )
+
+            accepted_price = Decimal(
+                final_entry["offered_price_per_unit"],
+            )
+
+            list_price = Decimal(
+                final_entry.get(
+                    "list_price_per_unit",
+                    "100.00",
+                )
+            )
+
+            total_revenue += (
+                accepted_price * quantity
+            )
+
+            if list_price > Decimal("0"):
+                discount = (
+                    (list_price - accepted_price)
+                    / list_price
+                ) * Decimal("100")
+
+                discounts.append(discount)
+
+            closing_rounds.append(
+                int(final_entry["round"]),
+            )
+
+        elif status == "no_deal":
+            no_deal_count += 1
+
+    total_closed = (
+        accepted_count + no_deal_count
+    )
+
+    if total_closed == 0:
+        win_rate = None
+    else:
+        win_rate = (
+            Decimal(accepted_count)
+            / Decimal(total_closed)
+        ) * Decimal("100")
+
+    if discounts:
+        average_discount = (
+            sum(discounts)
+            / Decimal(len(discounts))
+        )
+    else:
+        average_discount = None
+
+    if closing_rounds:
+        average_rounds = (
+            Decimal(sum(closing_rounds))
+            / Decimal(len(closing_rounds))
+        )
+    else:
+        average_rounds = None
+
+    return {
+        "accepted_count": accepted_count,
+        "no_deal_count": no_deal_count,
+        "total_negotiations": total_closed,
+        "win_rate_percent": (
+            str(win_rate.quantize(Decimal("0.01")))
+            if win_rate is not None
+            else None
+        ),
+        "average_discount_percent": (
+            str(
+                average_discount.quantize(
+                    Decimal("0.01"),
+                )
+            )
+            if average_discount is not None
+            else None
+        ),
+        "average_rounds_to_close": (
+            str(
+                average_rounds.quantize(
+                    Decimal("0.01"),
+                )
+            )
+            if average_rounds is not None
+            else None
+        ),
+        "total_negotiated_revenue": str(
+            total_revenue.quantize(
+                Decimal("0.01"),
+            )
+        ),
+    }
 
 
 # ============================================================================

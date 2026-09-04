@@ -35,6 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from .db import (
+    get_merchant_analytics,
     count_session_requests,
     create_session,
     get_highest_offer,
@@ -50,6 +51,12 @@ from .engine import (
     NegotiationRequest,
     NegotiationStatus,
     decide_negotiation_step,
+)
+from .merchant_config import (
+    MerchantConfig,
+    get_merchant_config,
+    get_runtime_negotiation_config,
+    save_merchant_config,
 )
 from .llm import generate_explanation
 from .razorpay_client import create_payment_link
@@ -72,8 +79,6 @@ logging.basicConfig(
 
 MAX_REQUESTS_PER_SESSION = 5
 DEFAULT_PRODUCT_ID = "demo-product"
-
-config = NegotiationConfig()
 
 
 # ============================================================================
@@ -166,6 +171,9 @@ async def request_validation_exception_handler(
     RequestValidationError rather than a raw JSONDecodeError.
 
     Therefore this single handler covers the required security-rejection path.
+
+    Validation details are sanitized before being returned because Pydantic
+    may place exception objects such as ValueError inside the "ctx" field.
     """
 
     session_id: Optional[UUID] = None
@@ -178,7 +186,27 @@ async def request_validation_exception_handler(
         # The security event is still recorded with a NULL session ID.
         pass
 
-    errors = exc.errors()
+    raw_errors = exc.errors()
+
+    # ------------------------------------------------------------------------
+    # Sanitize Pydantic validation errors so that every value is JSON
+    # serializable. In particular, "ctx" may contain ValueError objects.
+    # ------------------------------------------------------------------------
+
+    errors: list[dict[str, Any]] = []
+
+    for error in raw_errors:
+        sanitized_error = dict(error)
+
+        if "ctx" in sanitized_error:
+            sanitized_ctx: dict[str, Any] = {}
+
+            for key, value in sanitized_error["ctx"].items():
+                sanitized_ctx[key] = str(value)
+
+            sanitized_error["ctx"] = sanitized_ctx
+
+        errors.append(sanitized_error)
 
     reason = json.dumps(
         errors,
@@ -211,6 +239,86 @@ async def request_validation_exception_handler(
 
 
 # ============================================================================
+# Merchant configuration
+# ============================================================================
+
+
+@app.get("/api/merchant/config")
+async def get_merchant_config_endpoint() -> dict[str, Any]:
+    """
+    Return the currently active merchant pricing configuration.
+    """
+
+    config = get_merchant_config()
+
+    return {
+        "p_list": str(config.p_list),
+        "floor_1_9": str(config.floor_1_9),
+        "floor_10_49": str(config.floor_10_49),
+        "floor_50_99": str(config.floor_50_99),
+        "floor_100_plus": str(config.floor_100_plus),
+        "alpha": str(config.alpha),
+        "max_rounds": config.max_rounds,
+    }
+
+
+@app.post("/api/merchant/config")
+async def update_merchant_config(
+    config: MerchantConfig,
+) -> dict[str, Any]:
+    """
+    Validate and persist merchant pricing configuration.
+    """
+
+    saved_config = save_merchant_config(config)
+
+    return {
+        "message": "Merchant configuration updated successfully.",
+        "config": {
+            "p_list": str(saved_config.p_list),
+            "floor_1_9": str(saved_config.floor_1_9),
+            "floor_10_49": str(saved_config.floor_10_49),
+            "floor_50_99": str(saved_config.floor_50_99),
+            "floor_100_plus": str(saved_config.floor_100_plus),
+            "alpha": str(saved_config.alpha),
+            "max_rounds": saved_config.max_rounds,
+        },
+    }
+
+
+# ============================================================================
+# Merchant analytics
+# ============================================================================
+
+
+@app.get("/api/merchant/analytics")
+async def get_merchant_analytics_endpoint() -> dict[str, Any]:
+    return get_merchant_analytics()
+
+
+# ============================================================================
+# Product information
+# ============================================================================
+
+
+@app.get("/api/product")
+async def get_product_info() -> dict[str, Any]:
+    """
+    Return the current product pricing and inventory information.
+    """
+
+    config = get_runtime_negotiation_config()
+    stock = get_stock(DEFAULT_PRODUCT_ID)
+
+    return {
+        "product_id": DEFAULT_PRODUCT_ID,
+        "name": "Enterprise Widget",
+        "list_price_per_unit": str(config.p_list),
+        "stock": stock,
+    }
+
+
+# ============================================================================
 # Negotiation endpoint
 # ============================================================================
 
@@ -224,6 +332,8 @@ async def negotiate_step(
 
     Pydantic validation has already completed before this function runs.
     """
+
+    config = get_runtime_negotiation_config()
 
     # ========================================================================
     # 1. Session initialization
@@ -393,21 +503,33 @@ async def negotiate_step(
             "payment_link": None,
         }
 
-    # Reduce requested quantity if inventory has fallen.
-    effective_quantity = min(
-        request.quantity,
-        stock,
-    )
+    # ------------------------------------------------------------------------
+    # Reject requests that exceed currently available inventory.
+    # Never silently change the buyer's requested quantity.
+    # ------------------------------------------------------------------------
 
-    quantity_reduced = (
-        effective_quantity < request.quantity
-    )
+    if request.quantity > stock:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": {
+                    "code": "INSUFFICIENT_STOCK",
+                    "message": (
+                        f"Only {stock} units are currently "
+                        "available."
+                    ),
+                    "details": {
+                        "requested_quantity": request.quantity,
+                        "available_stock": stock,
+                    },
+                }
+            },
+        )
 
-    effective_request = request.model_copy(
-        update={
-            "quantity": effective_quantity,
-        },
-    )
+    effective_quantity = request.quantity
+    quantity_reduced = False
+
+    effective_request = request
 
     # ========================================================================
     # 5. Historical buyer maximum
@@ -448,6 +570,9 @@ async def negotiate_step(
     history.append(
         {
             "round": current_round,
+            "list_price_per_unit": str(
+                config.p_list,
+            ),
             "requested_quantity": request.quantity,
             "effective_quantity": effective_quantity,
             "stock_at_turn": stock,
